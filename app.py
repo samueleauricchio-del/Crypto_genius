@@ -102,5 +102,26 @@ def check_now():
     return jsonify({"status": "checked"})
 
 
+@app.route("/prices")
+def prices():
+    """
+    Current prices for a fixed set of major coins, for read-only consumption
+    (e.g. Kiedo periodic scraping). Query param 'ids' overrides the default list.
+    """
+    ids_param = request.args.get("ids", "bitcoin,ethereum,solana,tether,usd-coin")
+    try:
+        resp = requests.get(
+            f"{COINGECKO_BASE}/simple/price",
+            params={"ids": ids_param, "vs_currencies": "usd", "include_24hr_change": "true"},
+            timeout=10
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.exceptions.RequestException as e:
+        return jsonify({"error": str(e)}), 502
+
+    return jsonify({"prices": data})
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
