@@ -63,17 +63,13 @@ def home():
             "POST /watch": "body: {symbol, above?, below?} — set/update a price alert",
             "DELETE /watch/<symbol>": "remove an alert",
             "GET /check-now": "force an immediate price check (bypasses the 5-min schedule)",
-            "GET /prices": "current prices, optional ?symbols=BTCUSDT,ETHUSDT"
+            "GET /prices": "top N coins by volume, ?top=200 or ?symbols=BTCUSDT,ETHUSDT"
         }
     })
 
 
 @app.route("/watch", methods=["POST"])
 def add_watch():
-    """
-    Body: {"symbol": "BTCUSDT", "above": 70000, "below": 50000}
-    'symbol' must be a Binance ticker symbol (e.g. BTCUSDT, ETHUSDT, SOLUSDT).
-    """
     data = request.get_json(force=True)
     symbol = (data.get("symbol") or "").strip().upper()
     above = data.get("above")
@@ -100,30 +96,34 @@ def check_now():
 
 @app.route("/prices")
 def prices():
-    """
-    Current prices for major coins via Binance's public market-data-only API
-    (data-api.binance.vision) — no API key required, built for this exact use case.
-    Query param 'symbols' overrides the default list (Binance ticker symbols, e.g. BTCUSDT).
-    """
-    symbols_param = request.args.get("symbols", "BTCUSDT,ETHUSDT,SOLUSDT")
-    symbols = [s.strip().upper() for s in symbols_param.split(",")]
+    explicit = request.args.get("symbols")
+    top_n = min(int(request.args.get("top", 200)), 300)
 
-    results = {}
-    errors = {}
-    for symbol in symbols:
-        try:
-            resp = requests.get(
-                "https://data-api.binance.vision/api/v3/ticker/price",
-                params={"symbol": symbol},
-                timeout=10
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            results[symbol] = {"usd": float(data["price"])}
-        except requests.exceptions.RequestException as e:
-            errors[symbol] = str(e)
+    try:
+        resp = requests.get("https://data-api.binance.vision/api/v3/ticker/24hr", timeout=15)
+        resp.raise_for_status()
+        all_tickers = resp.json()
+    except (requests.exceptions.RequestException, ValueError) as e:
+        return jsonify({"error": str(e)}), 502
 
-    return jsonify({"prices": results, "errors": errors or None})
+    usdt_pairs = [t for t in all_tickers if t["symbol"].endswith("USDT")]
+
+    if explicit:
+        wanted = {s.strip().upper() for s in explicit.split(",")}
+        selected = [t for t in usdt_pairs if t["symbol"] in wanted]
+    else:
+        usdt_pairs.sort(key=lambda t: float(t["quoteVolume"]), reverse=True)
+        selected = usdt_pairs[:top_n]
+
+    results = {
+        t["symbol"]: {
+            "usd": float(t["lastPrice"]),
+            "change_24h_pct": round(float(t["priceChangePercent"]), 2)
+        }
+        for t in selected
+    }
+
+    return jsonify({"count": len(results), "prices": results})
 
 
 if __name__ == "__main__":
