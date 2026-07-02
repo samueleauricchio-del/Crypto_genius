@@ -5,13 +5,9 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
 
-COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# In-memory watchlist: { "bitcoin": {"above": 65000, "below": 55000, "triggered": set()} }
-# NOTE: in-memory = resets on redeploy/restart. Fine for a test project; swap for a
-# real DB (e.g. Railway Postgres) if this needs to survive restarts.
 watchlist = {}
 
 
@@ -30,30 +26,25 @@ def check_prices():
     if not watchlist:
         return
 
-    ids = ",".join(watchlist.keys())
-    try:
-        resp = requests.get(
-            f"{COINGECKO_BASE}/simple/price",
-            params={"ids": ids, "vs_currencies": "usd"},
-            timeout=10
-        )
-        resp.raise_for_status()
-        prices = resp.json()
-    except requests.exceptions.RequestException as e:
-        print(f"[ERROR] CoinGecko fetch failed: {e}")
-        return
-
-    for coin_id, rules in watchlist.items():
-        if coin_id not in prices:
+    for symbol, rules in watchlist.items():
+        try:
+            resp = requests.get(
+                "https://data-api.binance.vision/api/v3/ticker/price",
+                params={"symbol": symbol},
+                timeout=10
+            )
+            resp.raise_for_status()
+            current = float(resp.json()["price"])
+        except (requests.exceptions.RequestException, KeyError, ValueError) as e:
+            print(f"[ERROR] Binance fetch failed for {symbol}: {e}")
             continue
-        current = prices[coin_id]["usd"]
 
         if rules.get("above") and current >= rules["above"] and "above" not in rules["triggered"]:
-            send_telegram_message(f"🚀 {coin_id.upper()} ha superato ${rules['above']}: ora è a ${current}")
+            send_telegram_message(f"🚀 {symbol} ha superato ${rules['above']}: ora è a ${current}")
             rules["triggered"].add("above")
 
         if rules.get("below") and current <= rules["below"] and "below" not in rules["triggered"]:
-            send_telegram_message(f"📉 {coin_id.upper()} è sceso sotto ${rules['below']}: ora è a ${current}")
+            send_telegram_message(f"📉 {symbol} è sceso sotto ${rules['below']}: ora è a ${current}")
             rules["triggered"].add("below")
 
 
@@ -69,31 +60,36 @@ def home():
         "service": "Crypto Price Watchdog",
         "watchlist": {k: {"above": v.get("above"), "below": v.get("below")} for k, v in watchlist.items()},
         "endpoints": {
-            "POST /watch": "body: {coin_id, above?, below?} — set/update a price alert",
-            "DELETE /watch/<coin_id>": "remove an alert",
-            "GET /check-now": "force an immediate price check (bypasses the 5-min schedule)"
+            "POST /watch": "body: {symbol, above?, below?} — set/update a price alert",
+            "DELETE /watch/<symbol>": "remove an alert",
+            "GET /check-now": "force an immediate price check (bypasses the 5-min schedule)",
+            "GET /prices": "current prices, optional ?symbols=BTCUSDT,ETHUSDT"
         }
     })
 
 
 @app.route("/watch", methods=["POST"])
 def add_watch():
+    """
+    Body: {"symbol": "BTCUSDT", "above": 70000, "below": 50000}
+    'symbol' must be a Binance ticker symbol (e.g. BTCUSDT, ETHUSDT, SOLUSDT).
+    """
     data = request.get_json(force=True)
-    coin_id = data.get("coin_id")
+    symbol = (data.get("symbol") or "").strip().upper()
     above = data.get("above")
     below = data.get("below")
 
-    if not coin_id or (above is None and below is None):
-        return jsonify({"error": "need coin_id and at least one of 'above'/'below'"}), 400
+    if not symbol or (above is None and below is None):
+        return jsonify({"error": "need symbol (e.g. BTCUSDT) and at least one of 'above'/'below'"}), 400
 
-    watchlist[coin_id] = {"above": above, "below": below, "triggered": set()}
-    return jsonify({"status": "watching", "coin_id": coin_id, "above": above, "below": below})
+    watchlist[symbol] = {"above": above, "below": below, "triggered": set()}
+    return jsonify({"status": "watching", "symbol": symbol, "above": above, "below": below})
 
 
-@app.route("/watch/<coin_id>", methods=["DELETE"])
-def remove_watch(coin_id):
-    watchlist.pop(coin_id, None)
-    return jsonify({"status": "removed", "coin_id": coin_id})
+@app.route("/watch/<symbol>", methods=["DELETE"])
+def remove_watch(symbol):
+    watchlist.pop(symbol.upper(), None)
+    return jsonify({"status": "removed", "symbol": symbol.upper()})
 
 
 @app.route("/check-now")
@@ -105,22 +101,29 @@ def check_now():
 @app.route("/prices")
 def prices():
     """
-    Current prices for a fixed set of major coins, for read-only consumption
-    (e.g. Kiedo periodic scraping). Query param 'ids' overrides the default list.
+    Current prices for major coins via Binance's public market-data-only API
+    (data-api.binance.vision) — no API key required, built for this exact use case.
+    Query param 'symbols' overrides the default list (Binance ticker symbols, e.g. BTCUSDT).
     """
-    ids_param = request.args.get("ids", "bitcoin,ethereum,solana,tether,usd-coin")
-    try:
-        resp = requests.get(
-            f"{COINGECKO_BASE}/simple/price",
-            params={"ids": ids_param, "vs_currencies": "usd", "include_24hr_change": "true"},
-            timeout=10
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.exceptions.RequestException as e:
-        return jsonify({"error": str(e)}), 502
+    symbols_param = request.args.get("symbols", "BTCUSDT,ETHUSDT,SOLUSDT")
+    symbols = [s.strip().upper() for s in symbols_param.split(",")]
 
-    return jsonify({"prices": data})
+    results = {}
+    errors = {}
+    for symbol in symbols:
+        try:
+            resp = requests.get(
+                "https://data-api.binance.vision/api/v3/ticker/price",
+                params={"symbol": symbol},
+                timeout=10
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            results[symbol] = {"usd": float(data["price"])}
+        except requests.exceptions.RequestException as e:
+            errors[symbol] = str(e)
+
+    return jsonify({"prices": results, "errors": errors or None})
 
 
 if __name__ == "__main__":
